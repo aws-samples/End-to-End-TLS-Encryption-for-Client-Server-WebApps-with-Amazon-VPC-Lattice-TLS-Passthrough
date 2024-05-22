@@ -1,0 +1,1101 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  AWS CloudFormation Template: 
+  **WARNING** You will be billed for the AWS resources used if you create a stack from this template.
+
+###############################################
+# Parameters
+###############################################
+Parameters:
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+    Description: This is AMI to be used for the Amazon EC2 instances
+    
+  CertificateArn:
+    Type: String
+    Description: ARN of the private ACM certificate (needs to be private!!!)
+
+  SecretString:
+    Type: String
+    Description: This is the certificate's secret. You can enter whatever string you want here.
+  
+  LatticeServiceDomain:
+    Type: String
+    Description: Custom domain name for the Lattice service. For example  'lattice.blog.com' (the certificate above will be then '*.blog.com')
+
+  Route53PrivateHostedZone:
+    Type: String
+    Description: The Route53 Private Hosted Zone Name. If previous parameter is 'lattice.blog.com', this should be 'blog.com'
+
+Resources:
+###############################################
+# S3 bucket with a random name
+###############################################  
+  RandomStringResource:
+    Type: Custom::RandomString
+    Properties:
+      ServiceToken: !GetAtt "RandomStringFunction.Arn"
+      Length: "8"
+
+  RandomStringFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Timeout: 10
+      Role: !GetAtt "RandomStringFunctionExecutionRole.Arn"
+      Runtime: python3.10
+      Code:
+        ZipFile: |
+          import cfnresponse
+          from random import choice
+          from string import ascii_lowercase, digits
+          def random_string(length=8, chars=ascii_lowercase + digits):
+            return "".join(choice(chars) for x in range(length))
+          def lambda_handler(event, context):
+            print(f"Data in event: {event}")
+            response_data = {}
+            if event["RequestType"] == "Create":
+              string_length = int(event["ResourceProperties"]["Length"])
+              physicalResourceId = random_string(string_length)
+              response_data = { "RandomString": physicalResourceId }
+            
+            else: # if event["RequestType"] == "Update" or event["RequestType"] == "Delete":
+              physicalResourceId = event["PhysicalResourceId"]
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physicalResourceId)
+
+  RandomStringFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition: {}
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  RandomBucketName:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - RandomStringResource
+    Properties: 
+      BucketName:
+        Fn::Join:
+          - '-'
+          - ['tls-ssl-certificates', !Ref "AWS::Region", !GetAtt RandomStringResource.RandomString]      
+
+  CleanupBucket:
+    Type: Custom::cleanupbucketlambda
+    Properties:
+      ServiceToken:
+       Fn::GetAtt:
+          - "CleanupBucketLambda"
+          - "Arn"
+      BucketName: !Ref RandomBucketName
+
+  CleanupLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/CleanupS3Lambda
+      RetentionInDays: 30
+
+  CleanupBucketLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: !Sub CleanupBucketLambdaPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:DescribeLogStreams
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - s3:DeleteObject
+            - s3:ListBucket
+            Resource: '*'
+  
+  CleanupBucketLambda:
+    Type: AWS::Lambda::Function    
+    Properties:
+      FunctionName: !Sub CleanupBucketLambda
+      Handler: "index.lambda_handler"
+      Runtime: python3.10
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt CleanupBucketLambdaRole.Arn
+      Code:
+        ZipFile: !Sub |
+            import json, boto3, logging, os, urllib3
+            import cfnresponse
+            logger = logging.getLogger()
+            logger.setLevel(logging.INFO)
+            AccountId = os.environ['AccountId']
+            S3Bucket = os.environ['S3Bucket']
+            def lambda_handler(event, context):
+                logger.info("event: {}".format(event))
+                try:
+                    bucket = event['ResourceProperties']['BucketName']
+                    logger.info("bucket: {}, event['RequestType']: {}".format(bucket,event['RequestType']))
+                    if event['RequestType'] == 'Delete':
+                        s3 = boto3.resource('s3')
+                        bucket = s3.Bucket(bucket)
+                        for obj in bucket.objects.filter():
+                            logger.info("delete obj: {}".format(obj))
+                            s3.Object(bucket.name, obj.key).delete()                 
+                    sendResponseCfn(event, context, cfnresponse.SUCCESS)
+                except Exception as e:
+                    logger.info("Exception: {}".format(e))
+                    sendResponseCfn(event, context, cfnresponse.FAILED)
+            def sendResponseCfn(event, context, responseStatus):
+                responseData = {}
+                responseData['Data'] = {}
+                cfnresponse.send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")
+      Environment:
+        Variables:
+          Region:
+            !Ref "AWS::Region"
+          AccountId:
+            !Ref "AWS::AccountId"
+          S3Bucket: !Ref RandomBucketName
+
+###############################################
+# Lambda function to export certificate
+###############################################
+  ExportCertificateLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt ExportCertificateLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+          import os
+          from botocore.exceptions import ClientError
+
+          s3_client = boto3.client('s3')
+          acm_client = boto3.client('acm')
+
+          def lambda_handler(event, context):
+              certificate_arn = os.environ['CERTIFICATE_ARN']
+              s3_bucket_name = os.environ['S3_BUCKET_NAME']
+              cert_secret = os.environ['CERT_PASS']
+              responseData = {}
+
+              if event['RequestType'] == 'Create':
+                  try:
+                      response = acm_client.export_certificate(
+                          CertificateArn=certificate_arn,
+                          Passphrase=cert_secret.encode('utf-8')
+                      )
+                      private_key = response['PrivateKey'].encode('utf-8')
+                      certificate = response['Certificate'].encode('utf-8')
+                      certificate_chain = response['CertificateChain'].encode('utf-8')
+                      
+                      with open('/tmp/private_key.key', 'wb') as f:
+                          f.write(private_key)
+                      
+                      with open('/tmp/certificate.crt', 'wb') as f:
+                          f.write(certificate)
+                          
+                      with open('/tmp/certificate_chain.crt', 'wb') as f:
+                          f.write(certificate_chain)
+                      
+                      s3_client.upload_file('/tmp/private_key.key', s3_bucket_name, 'private_key.key')
+                      s3_client.upload_file('/tmp/certificate.crt', s3_bucket_name, 'certificate.crt')
+                      s3_client.upload_file('/tmp/certificate_chain.crt', s3_bucket_name, 'certificate_chain.crt')
+                      
+                  except ClientError as e:
+                      return cfnresponse.send(event, context, cfnresponse.FAILED, responseData, reason=str(e))
+                      
+                  return cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+
+              elif event['RequestType'] in ('Update', 'Delete'):
+                  pass
+              
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+
+      Runtime: python3.10
+      Timeout: 30
+      Environment:
+        Variables:
+          CERT_PASS: !Ref SecretString
+          CERTIFICATE_ARN: !Ref CertificateArn
+          S3_BUCKET_NAME: !Ref RandomBucketName
+      MemorySize: 128
+
+  ExportCertificateLambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        - PolicyName: LambdaFunctionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:DeleteObject'
+                  - 's3:DeleteBucket'
+                  - 'acm:ExportCertificate'
+                  - 'acm:ListCertificates'
+                  - 'acm:DescribeCertificate'
+                  - 'acm:DescribeCertificate'
+                  - 'acm:GetCertificate'
+                Resource: '*'
+###########################################################
+# Custom resource to invoke export acm Lambda
+###########################################################
+  ExportACMLambdaInvoke:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - ExportCertificateLambdaFunction
+      - ExportCertificateLambdaExecutionRole
+    Properties:
+      ServiceToken: !GetAtt ExportCertificateLambdaFunction.Arn
+
+###############################################
+# VPC resources - VPC consumer and VPC Producer 
+###############################################
+  ConsumerVPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ConsumerVPC
+
+  ProducerVPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: 10.10.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ProducerVPC
+
+  SubnetAConsumer:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref ConsumerVPC
+      CidrBlock: 10.20.2.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags:
+        - Key: Name
+          Value: SubnetAConsumer
+
+  SubnetBConsumer:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref ConsumerVPC
+      CidrBlock: 10.20.4.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      Tags:
+        - Key: Name
+          Value: SubnetBConsumer
+
+  SubnetAProducer:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref ProducerVPC
+      CidrBlock: 10.10.2.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags:
+        - Key: Name
+          Value: SubnetAProducer
+
+  SubnetBProducer:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref ProducerVPC
+      CidrBlock: 10.10.4.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      Tags:
+        - Key: Name
+          Value: SubnetBProducer
+
+  RouteTableConsumer:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref ConsumerVPC
+      Tags:
+        - Key: Name
+          Value: RouteTableConsumerPrivate
+
+  RouteTableProducer:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref ProducerVPC
+      Tags:
+        - Key: Name
+          Value: RouteTableProducerPrivate
+
+  RouteTableAssociationAConsumer:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref SubnetAConsumer
+      RouteTableId: !Ref RouteTableConsumer
+
+  RouteTableAssociationBConsumer:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref SubnetBConsumer
+      RouteTableId: !Ref RouteTableConsumer
+
+  RouteTableAssociationAProducer:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref SubnetAProducer
+      RouteTableId: !Ref RouteTableProducer
+
+  RouteTableAssociationBProducer:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref SubnetBProducer
+      RouteTableId: !Ref RouteTableProducer
+    
+###############################################
+# Lattice Prefix List ID retrieval
+###############################################
+  LatticePrefixListLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: LatticePrefixListLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeManagedPrefixLists
+                Resource: "*"
+
+  LatticePrefixListLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - RandomStringResource
+    Properties:
+      Handler: index.lambda_handler
+      FunctionName:
+        Fn::Join:
+          - '-'
+          - ['lambda-prefixlist', !GetAtt RandomStringResource.RandomString]
+      Role: !GetAtt LatticePrefixListLambdaFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      region = event['ResourceProperties']['Region']
+                      service_name = f"com.amazonaws.{region}.vpc-lattice"
+                      
+                      ec2_client = boto3.client('ec2', region_name=region)
+                      response = ec2_client.describe_managed_prefix_lists(
+                          Filters=[
+                              {
+                                  'Name': 'prefix-list-name',
+                                  'Values': [service_name]
+                              }
+                          ]
+                      )
+                      prefix_list_id = response['PrefixLists'][0]['PrefixListId']
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'PrefixListId': prefix_list_id
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+      Runtime: python3.10
+      Timeout: 60
+  
+  LatticePrefixListCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - ProducerVPC
+      - ConsumerVPC
+    Properties:
+      ServiceToken: !GetAtt LatticePrefixListLambdaFunction.Arn
+      Region: !Ref "AWS::Region"
+
+###############################################
+# Security Groups 
+###############################################
+  ProducerInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn:
+      - LatticePrefixListCustomResource
+    Properties:
+      GroupName: producer-instances-sg
+      GroupDescription: Instance Security Group
+      VpcId: !Ref ProducerVPC
+      SecurityGroupIngress:
+        - Description: Allowing all IPv4 traffic
+          IpProtocol: "-1"
+          CidrIp: 10.0.0.0/8
+        - IpProtocol: "-1"
+          FromPort: -1
+          ToPort: -1
+          SourcePrefixListId: !GetAtt LatticePrefixListCustomResource.PrefixListId
+        - IpProtocol: "-1"
+          FromPort: -1
+          ToPort: -1
+  
+  ProducerEndpointsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn:
+      - LatticePrefixListCustomResource
+    Properties:
+      GroupName: endpoints-sg
+      GroupDescription: Endpoints Security Group
+      VpcId: !Ref ProducerVPC
+      SecurityGroupIngress:
+        - Description: Allowing HTTPS
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ProducerInstanceSecurityGroup
+  
+  LatticeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn:
+      - LatticePrefixListCustomResource
+    Properties:
+      GroupName: lattice-sg
+      GroupDescription: VPC Lattice Security Group
+      VpcId: !Ref ProducerVPC
+      SecurityGroupIngress:
+        - Description: Allowing HTTP
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ProducerInstanceSecurityGroup
+        - Description: Allowing HTTPS
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ProducerInstanceSecurityGroup
+        - IpProtocol: "-1"
+          FromPort: -1
+          ToPort: -1
+          SourcePrefixListId: !GetAtt LatticePrefixListCustomResource.PrefixListId
+        - IpProtocol: "-1"
+          FromPort: -1
+          ToPort: -1
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "tcp"
+          FromPort: 443
+          ToPort: 443
+
+  ConsumerInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn:
+      - LatticePrefixListCustomResource
+    Properties:
+      GroupName: instance-sg
+      GroupDescription: Instance Security Group
+      VpcId: !Ref ConsumerVPC
+      SecurityGroupIngress:
+        - Description: Allowing all IPv4 traffic
+          IpProtocol: "-1"
+          CidrIp: 10.0.0.0/8
+        - IpProtocol: "-1"
+          FromPort: -1
+          ToPort: -1
+          SourcePrefixListId: !GetAtt LatticePrefixListCustomResource.PrefixListId
+        - IpProtocol: "-1"
+          FromPort: -1
+          ToPort: -1
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "tcp"
+          FromPort: 443
+          ToPort: 443
+  
+  ConsumerEndpointsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn:
+      - ConsumerVPC
+    Properties:
+      GroupName: endpoints-sg
+      GroupDescription: Endpoints Security Group
+      VpcId: !Ref ConsumerVPC
+      SecurityGroupIngress:
+        - Description: Allowing HTTPS
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ConsumerInstanceSecurityGroup
+
+##############################################
+# S3 and SSM VPC endpoints
+###############################################
+  S3VPCProducerEndpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    DependsOn:
+      - ProducerVPC
+    Properties:
+      VpcEndpointType: 'Gateway'
+      VpcId: !Ref ProducerVPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds:
+        - !Ref RouteTableProducer
+
+  S3VPCConsumerEndpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    DependsOn:
+      - ConsumerVPC
+    Properties:
+      VpcEndpointType: 'Gateway'
+      VpcId: !Ref ConsumerVPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds:
+        - !Ref RouteTableConsumer
+
+  SSMProducerVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn:
+      - ProducerVPC
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcId: !Ref ProducerVPC
+      SubnetIds:
+        - !Ref SubnetAProducer
+        - !Ref SubnetBProducer
+      SecurityGroupIds:
+        - !Ref ProducerEndpointsSecurityGroup
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: True
+
+  SSMMessagesProducerVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn:
+      - ProducerVPC
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcId: !Ref ProducerVPC
+      SubnetIds:
+        - !Ref SubnetAProducer
+        - !Ref SubnetBProducer
+      SecurityGroupIds:
+        - !Ref ProducerEndpointsSecurityGroup
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: True
+
+  EC2MessagesProducerVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn:
+      - ProducerVPC
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcId: !Ref ProducerVPC
+      SubnetIds:
+        - !Ref SubnetAProducer
+        - !Ref SubnetBProducer
+      SecurityGroupIds:
+        - !Ref ProducerEndpointsSecurityGroup
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: True
+
+  SSMConsumerVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn:
+      - ConsumerVPC
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcId: !Ref ConsumerVPC
+      SubnetIds:
+        - !Ref SubnetAConsumer
+        - !Ref SubnetBConsumer
+      SecurityGroupIds:
+        - !Ref ConsumerEndpointsSecurityGroup
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: True
+
+  SSMMessagesConsumerVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn:
+      - ConsumerVPC
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcId: !Ref ConsumerVPC
+      SubnetIds:
+        - !Ref SubnetAConsumer
+        - !Ref SubnetBConsumer
+      SecurityGroupIds:
+        - !Ref ConsumerEndpointsSecurityGroup
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: True
+
+  EC2MessagesConsumerVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn:
+      - ConsumerVPC
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcId: !Ref ConsumerVPC
+      SubnetIds:
+        - !Ref SubnetAConsumer
+        - !Ref SubnetBConsumer
+      SecurityGroupIds:
+        - !Ref ConsumerEndpointsSecurityGroup
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: True
+
+###############################################
+# EC2 roles
+###############################################
+  EC2IAMRoleWorkloads:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Path: /
+      Policies:
+      - PolicyName: S3AccessPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListBucket
+              Resource: '*'
+
+  EC2SSMInstanceProfileWorkloads:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2IAMRoleWorkloads
+
+##############################################
+# Client Server in Consumer VPC
+###############################################
+  ServerConsumerVPC:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - S3VPCConsumerEndpoint
+      - WorkloadLaunchTemplate
+      - RandomBucketName
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: "t3.micro"
+      SubnetId: !Ref SubnetAConsumer
+      SecurityGroupIds:
+        - !Ref ConsumerInstanceSecurityGroup
+      IamInstanceProfile: !Ref EC2SSMInstanceProfileWorkloads
+      Tags:
+        - Key: Name
+          Value: Consumer Server
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          sudo yum update -y
+          sudo mkdir -p /etc/pki/ca-trust/source/anchors/
+          sudo aws s3 cp s3://${RandomBucketName}/certificate_chain.crt /etc/pki/ca-trust/source/anchors/
+          sudo update-ca-trust
+
+####################################################################
+# VPC Lattice Resources, Auto Scaling Group and Launch Template
+####################################################################
+  LatticeTLSASGService:
+    Type: AWS::VpcLattice::Service
+    DependsOn:
+      - RandomStringResource
+    Properties:
+      Name:
+        Fn::Join:
+          - '-'
+          - ['tls-asg-service-cfn', !GetAtt RandomStringResource.RandomString]
+      CertificateArn: !Ref CertificateArn
+      CustomDomainName: !Ref LatticeServiceDomain
+      AuthType: NONE
+  
+  LatticeTLSASGAuthPolicy:
+    Type: AWS::VpcLattice::AuthPolicy
+    Properties:
+      ResourceIdentifier: !Ref LatticeTLSASGService
+      Policy:
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+  
+  LatticeTLSASGVPCAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkVpcAssociation
+    DependsOn:
+      - ConsumerVPC
+      - ServiceNetwork
+      - ConsumerInstanceSecurityGroup
+    Properties:
+      SecurityGroupIds:
+        - !Ref ConsumerInstanceSecurityGroup
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+      VpcIdentifier: !Ref ConsumerVPC
+  
+  ServiceNetwork:
+    Type: AWS::VpcLattice::ServiceNetwork
+    DependsOn:
+      - RandomStringResource
+    Properties:
+      Name:
+        Fn::Join:
+          - '-'
+          - ['tls-service-network-cfn', !GetAtt RandomStringResource.RandomString]      
+      AuthType: NONE
+  
+  ServiceNetworkServiceAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    DependsOn:
+      - ServiceNetwork
+      - LatticeTLSASGService
+    Properties:
+      ServiceIdentifier: !Ref LatticeTLSASGService
+      ServiceNetworkIdentifier: !Ref ServiceNetwork
+
+  WorkloadLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - S3VPCProducerEndpoint
+      - S3VPCConsumerEndpoint
+      - LatticeTLSASGVPCAssociation
+      - RandomBucketName
+      - RandomStringResource
+    Properties:
+      LaunchTemplateName:
+        Fn::Join:
+          - '-'
+          - ['workload-tls-template-cfn', !GetAtt RandomStringResource.RandomString]
+      VersionDescription: v1.0
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt EC2SSMInstanceProfileWorkloads.Arn
+        InstanceType: t3.micro
+        ImageId: !Ref LatestAmiId
+        SecurityGroupIds:
+          - !Ref ProducerInstanceSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: web-server-instance-autoscaling
+        UserData: 
+          Fn::Base64: !Sub | 
+            #!/bin/bash
+            sudo su
+            yum update -y
+            yum install -y httpd
+            yum install -y httpd mod_ssl
+            systemctl start httpd
+            systemctl enable httpd
+            echo "Congratulations!! You just have Amazon VPC Lattice TLS Passthrough enabled" > /var/www/html/index.html
+            aws s3 cp s3://${RandomBucketName}/certificate.crt /etc/pki/tls/certs/
+            aws s3 cp s3://${RandomBucketName}/certificate_chain.crt /etc/pki/tls/certs/
+            aws s3 cp s3://${RandomBucketName}/private_key.key /etc/pki/tls/private/
+            chmod 600 /etc/pki/tls/certs/certificate.crt
+            chmod 600 /etc/pki/tls/certs/certificate_chain.crt
+            chmod 600 /etc/pki/tls/private/private_key.key
+            echo "
+            <VirtualHost *:443>
+                ServerName ${LatticeServiceDomain}
+                SSLEngine on
+                SSLCertificateFile /etc/pki/tls/certs/certificate.crt
+                SSLCertificateKeyFile /etc/pki/tls/private/private_key.key
+                SSLCertificateChainFile /etc/pki/tls/certs/certificate_chain.crt
+            </VirtualHost>
+            " >> /etc/httpd/conf/httpd.conf
+            AWS_REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | sed 's/.$//')
+            aws configure set region $AWS_REGION
+            passphrase=${SecretString}
+            openssl rsa -passin pass:"$passphrase" -in /etc/pki/tls/private/private_key.key -out /etc/pki/tls/private/private_key.key
+            systemctl restart httpd
+  
+  VPCLatticeTargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name:
+        Fn::Join:
+          - '-'
+          - ['tls-tg-cfn', !GetAtt RandomStringResource.RandomString]
+      Type: INSTANCE
+      Config:
+        Port: 443
+        Protocol: TCP
+        VpcIdentifier: !Ref ProducerVPC
+        HealthCheck:
+          Enabled: false
+  
+  VPCLatticeListener:
+    Type: AWS::VpcLattice::Listener
+    DependsOn:
+      - RandomStringResource
+    Properties:
+      Name:
+        Fn::Join:
+          - '-'
+          - ['tls-listener-cfn', !GetAtt RandomStringResource.RandomString]
+      Port: 443
+      Protocol: TLS_PASSTHROUGH
+      ServiceIdentifier: !Ref LatticeTLSASGService
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref VPCLatticeTargetGroup
+              Weight: 100
+  
+  VPCLatticeAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - WorkloadLaunchTemplate
+      - RandomStringResource
+    Properties:
+      AutoScalingGroupName:
+        Fn::Join:
+          - '-'
+          - ['tls-asg-cfn', !GetAtt RandomStringResource.RandomString]
+      MinSize: 1
+      MaxSize: 2
+      DesiredCapacity: 2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkloadLaunchTemplate
+        Version: !GetAtt WorkloadLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !Ref SubnetAProducer
+        - !Ref SubnetBProducer
+      Tags:
+        - Key: Name
+          Value: apache-webserver-tls-asg
+          PropagateAtLaunch: true
+
+  AttachVPCLatticeTGtoASGLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt AttachVPCLatticeTGtoASGLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+          import os
+          from botocore.exceptions import ClientError
+          client = boto3.client('autoscaling')
+          def lambda_handler(event, context):
+              arn_value = os.environ['TG_ARN']
+              asg_name = os.environ['ASG_NAME']
+              responseData = {}
+              if event['RequestType'] == 'Create':
+                  try:
+                    response = client.attach_traffic_sources(
+                    AutoScalingGroupName=asg_name,
+                    TrafficSources=[
+                            {
+                            'Identifier': arn_value,
+                            'Type': 'vpc-lattice'
+                            },
+                        ]
+                    )
+                  except ClientError as e:
+                      return cfnresponse.send(event, context, cfnresponse.FAILED, responseData, reason=str(e))
+              elif event['RequestType'] == 'Delete':
+                  try:
+                    response = client.detach_traffic_sources(
+                    AutoScalingGroupName=asg_name,
+                    TrafficSources=[
+                            {
+                            'Identifier': arn_value,
+                            'Type': 'vpc-lattice'
+                            },
+                        ]
+                    )
+                  except ClientError as e:
+                      return cfnresponse.send(event, context, cfnresponse.FAILED, responseData, reason=str(e))
+              elif event['RequestType'] == 'Update':
+                  pass
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+      Runtime: python3.10
+      Timeout: 60
+      Environment:
+        Variables:
+          ASG_NAME: !Ref VPCLatticeAutoScalingGroup
+          TG_ARN: !GetAtt VPCLatticeTargetGroup.Arn
+      MemorySize: 128
+
+  AttachVPCLatticeTGtoASGLambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        - PolicyName: LambdaFunctionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+        - PolicyName: AttachDetachPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeTrafficSources
+                  - autoscaling:DetachTrafficSources
+                  - autoscaling:AttachTrafficSources
+                  - vpc-lattice:RegisterTargets
+                  - vpc-lattice:ListTargets
+                  - vpc-lattice:ListTargetGroups
+                  - vpc-lattice:DeregisterTargets
+                  - ec2:DescribeInstances
+                Resource: '*'
+
+###########################################################
+# Custom resource to invoke create lattice tg Lambda
+###########################################################
+  AttachVPCLatticeTGtoASGLambdaInvoke:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - VPCLatticeAutoScalingGroup
+    Properties:
+      ServiceToken: !GetAtt AttachVPCLatticeTGtoASGLambdaFunction.Arn
+
+###########################################################
+# Route53 Private Hosted Zone and Records for VPC Lattice
+###########################################################
+  R53PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    DependsOn:
+      - LatticeTLSASGService
+      - ProducerVPC
+      - ConsumerVPC
+    Properties:
+      HostedZoneConfig: 
+        Comment: 'Private hosted zone for TLS VPC Lattice Service'
+      Name: !Ref Route53PrivateHostedZone
+      VPCs: 
+        - 
+          VPCId: !Ref ProducerVPC
+          VPCRegion: !Sub '${AWS::Region}'
+        - 
+          VPCId: !Ref ConsumerVPC
+          VPCRegion: !Sub '${AWS::Region}'
+  
+  R53PrivateHostedZoneRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref R53PrivateHostedZone
+      Comment: DNS name for VPC Lattice TLS Service
+      Name: !Ref LatticeServiceDomain
+      Type: CNAME
+      TTL: 900
+      ResourceRecords:
+      - !GetAtt LatticeTLSASGService.DnsEntry.DomainName
+
+
+###############################################
+# Outputs
+###############################################        
+Outputs:  
+  VPCLatticeServiceID:
+    Description: "ID of the VPC Lattice Service"
+    Value: !GetAtt LatticeTLSASGService.Id
+
+  VPCLatticeServiceDomainName:
+    Description: "ID of the VPC Lattice Service"
+    Value: !GetAtt LatticeTLSASGService.DnsEntry.DomainName
+
+  VPCLatticeTGARN:
+    Description: "ARN of the VPC Lattice Target Group"
+    Value: !GetAtt VPCLatticeTargetGroup.Arn
+  
+  LaunchTemplateID:
+    Description: "ID of the Launch Template"
+    Value: !Ref WorkloadLaunchTemplate
+  
+  ProducerVPCID:
+    Description: "ID of the Producer VPC"
+    Value: !Ref ProducerVPC
+  
+  ProducerVPCSubnetA:
+    Description: "ID of the subnet A"
+    Value: !Ref SubnetAProducer
+  
+  ProducerVPCSubnetB:
+    Description: "ID of the subnet B"
+    Value: !Ref SubnetBProducer
