@@ -4,6 +4,17 @@
 
 ![Architecture](images/arch.png)
 
+## Resources created in this template
+- [ ] 1 Amazon VPC with 2 private subnets called Consumer VPC, acting as a consumer of the service.
+- [ ] 1 Amazon VPC with 2 private subnets called Producer VPC, acting as a producer of the service.
+- [ ] Endpoints in the Consumer VPC: AWS Systems Manager endpoints to access to Amazon EC2 instances via Sessions Manager and 1 Amazon S3 Gateway endpoint. 
+- [ ] Endpoints in the Producer VPC: AWS Systems Manager endpoints to access to Amazon EC2 instances via Sessions Manager and 1 Amazon S3 Gateway endpoint.
+- [ ] 1 Amazon S3 bucket to store the exported private certificate resources from ACM to be later installed in the Amazon EC2 instances upon creation.
+- [ ] Amazon VPC Lattice resources.
+- [ ] Amazon Route 53 Private Hosted Zone for the Amazon VPC Lattice Service domain name.
+- [ ] AWS IAM roles
+- [ ] AWS Lambda Functions: 1 function to associate the Amazon VPC Lattice target group to Amazon EC2 Autoscaling group, 1 function to create a random string to be used to randomize name of resources and 1 function to empty Amazon S3 bucket upon deletion of the AWS CloudFormation template.
+
 ## Requirements to deploy (AWS CloudFormation Parameters)
 
 - [ ] You need to have a private certificate imported to AWS Certificate Manager. **Important: You need a private certificate issued by a private certificate authority (CA) for use anywhere. For example, AWS Private CA**
