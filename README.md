@@ -7,6 +7,8 @@
 ## Resources created in this template
 - [ ] 1 Amazon VPC called Consumer VPC, with 2 private subnets, acting as a consumer of the service.
 - [ ] 1 Amazon VPC called Producer VPC, with 2 private subnets, acting as a producer of the service.
+- [ ] 1 Amazon EC2 instance in the Consumer VPC, called Consumer Instance, acting as a client (consumer) of the Amazon VPC Lattice service. This instance has the certificate chain installed. 
+- [ ] 2 Amazon EC2 instances in the Producer VPC in autoscaling, acting as servers (producers) of the Amazon VPC Lattice service.
 - [ ] Endpoints in the Consumer VPC: AWS Systems Manager endpoints to access to Amazon EC2 instances via Sessions Manager and 1 Amazon S3 Gateway endpoint. 
 - [ ] Endpoints in the Producer VPC: AWS Systems Manager endpoints to access to Amazon EC2 instances via Sessions Manager and 1 Amazon S3 Gateway endpoint.
 - [ ] 1 Amazon S3 bucket to store the exported private certificate resources from ACM to be later installed in the Amazon EC2 instances upon creation.
@@ -14,8 +16,6 @@
 - [ ] Amazon Route 53 Private Hosted Zone for the Amazon VPC Lattice Service domain name.
 - [ ] AWS IAM roles
 - [ ] AWS Lambda Functions: 1 function to associate the Amazon VPC Lattice target group to Amazon EC2 Autoscaling group, 1 function to create a random string to be used to randomize name of resources and 1 function to empty Amazon S3 bucket upon deletion of the AWS CloudFormation template.
-- [ ] 1 Amazon EC2 instance in the Consumer VPC, called Consumer Instance, acting as a client (consumer) of the Amazon VPC Lattice service. This instance has the certificate chain installed. 
-- [ ] 2 Amazon EC2 instances in the Producer VPC in autoscaling, acting as servers (producers) of the Amazon VPC Lattice service.
 
 ## Requirements to deploy (AWS CloudFormation Parameters)
 
@@ -33,7 +33,21 @@
 
 - [ ] The last requirement is to enter a certificate passphrase. When deploying the Apache application with TLS (Transport Layer Security) enabled using our CloudFormation template, we require a passphrase as a parameter. This passphrase is used to encrypt the private key of your SSL/TLS certificate. You can enter whatever string you want.
 
-## How to deploy
+## How to deploy via CLI
+
+```bash
+aws cloudformation create-stack \
+    --stack-name my-stack-name \
+    --template-body file://path/to/main.yaml \
+    --parameters \
+        ParameterKey=LatestAmiId,ParameterValue=/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+        ParameterKey=CertificateArn,ParameterValue=your-certificate-arn \
+        ParameterKey=SecretString,ParameterValue=your-secret-string \
+        ParameterKey=LatticeServiceDomain,ParameterValue=your.domain.com \
+        ParameterKey=Route53PrivateHostedZone,ParameterValue=domain.com \
+    --capabilities CAPABILITY_NAMED_IAM
+```
+## How to deploy via AWS Console
 
 - [ ] Clone or download this repo
 - [ ] Go to AWS CloudFormation console and click on create stack [with new resources (standard)]
@@ -68,6 +82,13 @@ Following the example in this repo, the commando would be:
 - [ ] Add "-v" to the command to gain more insight into the communication between the Consumer Server (client) and the server.
 
 ![Command2](images/command2.png)
+
+## Clean up your environment
+
+After navigating the new Amazon VPC Lattice feature, delete AWS CloudFormation Stack using AWS Console or AWS CLI:
+```bash
+aws cloudformation delete-stack --stack-name $STACKNAME
+```
 
 ## Authors
 - [ ] Daniel Neri
