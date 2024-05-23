@@ -87,7 +87,7 @@ Following the example in this repo, the commando would be:
 
 After navigating the new Amazon VPC Lattice feature, delete AWS CloudFormation Stack using AWS Console or AWS CLI:
 ```bash
-aws cloudformation delete-stack --stack-name $STACKNAME
+aws cloudformation delete-stack --stack-name my-stack-name
 ```
 
 ## Authors
